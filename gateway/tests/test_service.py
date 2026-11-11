@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from rabotyaga_gateway.hermes import HermesGatewayTransport
 from rabotyaga_gateway.protection import PlaintextProtector
 from rabotyaga_gateway.service import GatewayService
 from rabotyaga_gateway.store import GatewayStore, StoreError
@@ -14,6 +15,7 @@ class FakeHermes:
     def __init__(self, store: GatewayStore) -> None:
         self.store = store
         self.submissions = []
+        self.reconciliations = 0
         self.session_id = "test-hermes-session"
 
     async def ensure_session(self, device_id: str) -> str:
@@ -32,10 +34,24 @@ class FakeHermes:
             )
         return self.session_id
 
+    async def reconcile(self, device_id: str) -> None:
+        self.reconciliations += 1
+        state = self.store.chat_state(device_id)
+        for message in state["messages"]:
+            if message["role"] == "user" and message["status"] == "queued":
+                row = self.store._connection.execute(
+                    "SELECT admission_id FROM messages WHERE id = ?", (message["id"],)
+                ).fetchone()
+                self.store.complete_admission(
+                    device_id,
+                    row["admission_id"],
+                    {"text": "Восстановленный ответ Hermes", "status": "complete"},
+                )
+
     async def submit(self, device_id: str, request_id: str, text: str) -> dict:
         await self.ensure_session(device_id)
         self.store.add_user_message(device_id, request_id, text)
-        receipt = {"admission_id": f"admission-{request_id}", "status": "started"}
+        receipt = {"admission_id": f"admission-{request_id}", "status": "queued"}
         self.store.mark_admitted(device_id, request_id, receipt)
         self.submissions.append((request_id, text))
         return receipt
@@ -92,6 +108,23 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["messages"][-1]["text"], "Настоящий ответ Hermes")
         self.assertEqual(state["status"], "ready")
 
+    async def test_stale_queued_message_is_reconciled_from_hermes(self) -> None:
+        request_id = "12345678-1234-1234-1234-123456789abc"
+        await self.service.submit(
+            self.device_id, {"request_id": request_id, "text": "Проверка восстановления"}
+        )
+        with self.store._lock, self.store._connection:
+            self.store._connection.execute(
+                "UPDATE messages SET updated_at = updated_at - 60 WHERE request_id = ?",
+                (request_id,),
+            )
+
+        state = await self.service.state(self.device_id)
+
+        self.assertEqual(self.hermes.reconciliations, 1)
+        self.assertEqual([row["role"] for row in state["messages"]], ["user", "assistant"])
+        self.assertEqual(state["status"], "ready")
+
     async def test_approval_is_scoped_to_projected_choice(self) -> None:
         await self.hermes.ensure_session(self.device_id)
         self.store.upsert_approval(
@@ -113,6 +146,57 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "resolved")
         with self.assertRaises(ValueError):
             await self.hermes.approve(self.device_id, "prompt-1", "approve forever")
+
+
+class TransportReconciliationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reconcile_resumes_once_per_throttle_window(self) -> None:
+        temporary_root = Path(__file__).parent / ".tmp"
+        temporary_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=temporary_root) as temporary:
+            store = GatewayStore(Path(temporary) / "test.db", PlaintextProtector())
+            try:
+                code = store.create_pairing_code("Test iPhone")
+                device_id, _ = store.consume_pairing_code(code)
+                session_id = "test-hermes-session"
+                store.set_hermes_session(
+                    device_id,
+                    session_id,
+                    {
+                        "stored_session_id": session_id,
+                        "running": True,
+                        "replay_epoch": "before",
+                        "last_sequence": 1,
+                        "messages": [],
+                        "prompts": [],
+                    },
+                )
+                transport = HermesGatewayTransport(store, Path(temporary))
+                calls = []
+
+                async def no_start() -> None:
+                    return None
+
+                async def fake_rpc(method: str, **params) -> dict:
+                    calls.append((method, params))
+                    return {
+                        "stored_session_id": session_id,
+                        "running": False,
+                        "replay_epoch": "after",
+                        "last_sequence": 2,
+                        "messages": [],
+                        "prompts": [],
+                    }
+
+                transport.start = no_start
+                transport._rpc = fake_rpc
+
+                await transport.reconcile(device_id)
+                await transport.reconcile(device_id)
+
+                self.assertEqual([call[0] for call in calls], ["session.resume"])
+                self.assertEqual(store.chat_state(device_id)["status"], "ready")
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":

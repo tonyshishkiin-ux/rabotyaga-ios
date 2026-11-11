@@ -20,6 +20,7 @@ class HermesUnavailable(RuntimeError):
 
 class HermesTransport(Protocol):
     async def ensure_session(self, device_id: str) -> str: ...
+    async def reconcile(self, device_id: str) -> None: ...
     async def submit(self, device_id: str, request_id: str, text: str) -> dict: ...
     async def approve(self, device_id: str, prompt_id: str, choice: str) -> dict: ...
 
@@ -35,6 +36,8 @@ class HermesGatewayTransport:
         self._stop = asyncio.Event()
         self._runner: asyncio.Task | None = None
         self._create_locks: dict[str, asyncio.Lock] = {}
+        self._reconcile_locks: dict[str, asyncio.Lock] = {}
+        self._last_reconcile: dict[str, float] = {}
 
     def _load_client_api(self):
         source = self.hermes_home / "hermes-agent"
@@ -183,6 +186,20 @@ class HermesGatewayTransport:
             session_id = snapshot["stored_session_id"]
             self.store.set_hermes_session(device_id, session_id, snapshot)
             return session_id
+
+    async def reconcile(self, device_id: str) -> None:
+        session_id = await self.ensure_session(device_id)
+        loop = asyncio.get_running_loop()
+        if loop.time() - self._last_reconcile.get(device_id, 0.0) < 5.0:
+            return
+        lock = self._reconcile_locks.setdefault(device_id, asyncio.Lock())
+        async with lock:
+            if loop.time() - self._last_reconcile.get(device_id, 0.0) < 5.0:
+                return
+            snapshot = await self._rpc("session.resume", session_id=session_id)
+            resumed_id = str(snapshot.get("stored_session_id") or session_id)
+            self.store.set_hermes_session(device_id, resumed_id, snapshot)
+            self._last_reconcile[device_id] = loop.time()
 
     async def submit(self, device_id: str, request_id: str, text: str) -> dict:
         session_id = await self.ensure_session(device_id)

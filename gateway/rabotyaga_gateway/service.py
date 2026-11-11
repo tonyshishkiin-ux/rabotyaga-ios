@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 
@@ -8,6 +9,8 @@ from .store import GatewayStore, StoreError
 
 
 REQUEST_ID = re.compile(r"^[A-Za-z0-9-]{16,80}$")
+RECONCILE_QUEUED_AFTER_SECONDS = 10
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -21,6 +24,11 @@ class GatewayService:
 
     async def state(self, device_id: str) -> dict:
         await self.hermes.ensure_session(device_id)
+        if self.store.has_stale_queued_messages(device_id, RECONCILE_QUEUED_AFTER_SECONDS):
+            try:
+                await self.hermes.reconcile(device_id)
+            except Exception as exc:
+                logger.warning("Could not reconcile one Rabotyaga session: %s", type(exc).__name__)
         return self.store.chat_state(device_id)
 
     async def submit(self, device_id: str, payload: dict) -> dict:
