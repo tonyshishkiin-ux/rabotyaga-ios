@@ -38,6 +38,7 @@ enum GatewayClientError: LocalizedError {
 
 struct HermesGatewayClient {
     static let gatewayURLKey = "hermes.gateway.url.v1"
+    private static let publicGatewayURL = "https://rabotyaga.viralops.ru"
 
     private let keychain = KeychainStore()
     private let session: URLSession
@@ -45,6 +46,7 @@ struct HermesGatewayClient {
     private let encoder: JSONEncoder
 
     init() {
+        Self.migratePrivateGatewayURLIfNeeded()
         let configuration = URLSessionConfiguration.ephemeral
         configuration.waitsForConnectivity = true
         configuration.timeoutIntervalForRequest = 30
@@ -55,6 +57,14 @@ struct HermesGatewayClient {
         decoder.dateDecodingStrategy = .secondsSince1970
         encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
+    }
+
+    private static func migratePrivateGatewayURLIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard let storedURL = defaults.string(forKey: gatewayURLKey),
+              let host = URLComponents(string: storedURL)?.host?.lowercased(),
+              host.hasSuffix(".ts.net") else { return }
+        defaults.set(publicGatewayURL, forKey: gatewayURLKey)
     }
 
     func normalizedBaseURL(_ rawValue: String) throws -> URL {
