@@ -8,7 +8,9 @@ sessions owned by other clients, or provider credentials.
 ## Security boundaries
 
 - The HTTP listener refuses non-loopback binds.
-- Remote access must use **Tailscale Serve HTTPS**, never Funnel or a router port.
+- The Windows listener remains loopback-only. Remote access may use either
+  tailnet-only **Tailscale Serve HTTPS** or the dedicated public Caddy route
+  documented in `docs/HERMES_INTEGRATION.md`; Hermes itself is never published.
 - Pairing uses an eight-digit, one-use, ten-minute code.
 - Each device receives a unique revocable secret. The iOS app stores it in
   Keychain; Windows stores the derived signing key encrypted with current-user

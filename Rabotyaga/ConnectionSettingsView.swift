@@ -13,7 +13,7 @@ struct ConnectionSettingsView: View {
                 Section("Подключение Hermes") {
                     Label(statusTitle, systemImage: statusIcon)
                         .foregroundColor(statusColor)
-                    TextField("https://имя-устройства.tailnet.ts.net", text: $gatewayURL)
+                    TextField("https://rabotyaga.viralops.ru", text: $gatewayURL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled(true)
                         .keyboardType(.URL)
@@ -59,7 +59,7 @@ struct ConnectionSettingsView: View {
                     Text("Ключ устройства хранится только в Keychain. Каждый запрос подписывается и содержит одноразовый nonce. Hermes не публикуется в интернет.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
-                    Text("Для работы iPhone и Windows-компьютер должны быть подключены к одной сети Tailscale, а локальный шлюз — запущен.")
+                    Text("На iPhone нужен только интернет. Публичный HTTPS-шлюз передаёт подписанные запросы к Windows по приватному каналу; VPN на телефоне не требуется.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
@@ -90,7 +90,7 @@ struct ConnectionSettingsView: View {
     }
 
     private var version: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.2"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3"
     }
 
     private var statusTitle: String {

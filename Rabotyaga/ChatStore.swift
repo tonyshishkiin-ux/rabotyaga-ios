@@ -13,6 +13,7 @@ final class ChatStore: ObservableObject {
 
     private let client = HermesGatewayClient()
     private var pollingTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
     private var failedSubmission: (id: String, text: String)?
 
     init() {
@@ -22,6 +23,7 @@ final class ChatStore: ObservableObject {
 
     deinit {
         pollingTask?.cancel()
+        reconnectTask?.cancel()
     }
 
     func refresh(showActivity: Bool = true) async {
@@ -39,6 +41,7 @@ final class ChatStore: ObservableObject {
             connectionStatus = "offline"
             statusText = "Нет связи со шлюзом"
             if showActivity { errorMessage = error.localizedDescription }
+            scheduleReconnect()
         }
     }
 
@@ -148,6 +151,8 @@ final class ChatStore: ObservableObject {
 
     private func disconnectLocally() {
         pollingTask?.cancel()
+        reconnectTask?.cancel()
+        reconnectTask = nil
         isConfigured = false
         connectionStatus = "offline"
         statusText = nil
@@ -165,6 +170,32 @@ final class ChatStore: ObservableObject {
                     return
                 }
             }
+        }
+    }
+
+    private func scheduleReconnect() {
+        guard isConfigured, reconnectTask == nil else { return }
+        reconnectTask = Task { [weak self] in
+            var delay: UInt64 = 2
+            while let self, !Task.isCancelled, self.isConfigured {
+                try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
+                guard !Task.isCancelled else { return }
+                do {
+                    let state = try await self.client.fetchState()
+                    self.apply(state)
+                    self.errorMessage = nil
+                    self.reconnectTask = nil
+                    if state.status == "working" || state.status == "connecting" {
+                        self.startPolling()
+                    }
+                    return
+                } catch {
+                    self.connectionStatus = "offline"
+                    self.statusText = "Переподключение…"
+                    delay = min(delay * 2, 30)
+                }
+            }
+            self?.reconnectTask = nil
         }
     }
 

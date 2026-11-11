@@ -6,6 +6,10 @@ enum GatewayClientError: LocalizedError {
     case invalidURL
     case insecureURL
     case invalidResponse
+    case networkUnavailable
+    case timedOut
+    case cannotReachGateway
+    case tlsValidationFailed
     case server(Int, String)
 
     var errorDescription: String? {
@@ -18,6 +22,14 @@ enum GatewayClientError: LocalizedError {
             return "Для iPhone разрешён только защищённый адрес HTTPS"
         case .invalidResponse:
             return "Шлюз вернул неожиданный ответ"
+        case .networkUnavailable:
+            return "Нет подключения к интернету. Сообщение можно повторить после восстановления сети"
+        case .timedOut:
+            return "Шлюз не ответил вовремя. Проверьте интернет и повторите попытку"
+        case .cannotReachGateway:
+            return "Не удалось связаться со шлюзом Работяги"
+        case .tlsValidationFailed:
+            return "Не удалось проверить защищённое HTTPS-соединение"
         case .server(_, let message):
             return message
         }
@@ -148,7 +160,27 @@ struct HermesGatewayClient {
             guard let credentials else { throw GatewayClientError.notConfigured }
             sign(&request, body: body, path: path, credentials: credentials)
         }
-        let (data, response) = try await session.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch let error as URLError {
+            switch error.code {
+            case .notConnectedToInternet, .dataNotAllowed, .internationalRoamingOff:
+                throw GatewayClientError.networkUnavailable
+            case .timedOut:
+                throw GatewayClientError.timedOut
+            case .secureConnectionFailed, .serverCertificateHasBadDate,
+                 .serverCertificateUntrusted, .serverCertificateHasUnknownRoot,
+                 .serverCertificateNotYetValid, .clientCertificateRejected:
+                throw GatewayClientError.tlsValidationFailed
+            case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
+                 .networkConnectionLost:
+                throw GatewayClientError.cannotReachGateway
+            default:
+                throw error
+            }
+        }
         guard let http = response as? HTTPURLResponse else { throw GatewayClientError.invalidResponse }
         guard (200..<300).contains(http.statusCode) else {
             let serverError = try? decoder.decode(GatewayErrorResponse.self, from: data)

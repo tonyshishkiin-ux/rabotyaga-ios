@@ -1,4 +1,4 @@
-# Hermes integration for Работяга iOS 1.2
+# Hermes integration for Работяга iOS 1.3
 
 ## Confirmed local interfaces
 
@@ -26,22 +26,40 @@ Confirmed canonical capabilities:
 
 ```text
 iPhone app
-  HTTPS + Tailscale identity + per-device HMAC
+  Public HTTPS + per-device HMAC (no phone VPN)
       ↓
-Tailscale Serve (tailnet only, no Funnel)
+Ubuntu Caddy: exact API allowlist, body/time limits, no diagnostics
+      ↓ existing private Tailscale HTTPS channel
+Windows Tailscale Serve (tailnet only, no Funnel)
       ↓
 127.0.0.1:8787 Rabotyaga Gateway
-  DPAPI device keys, replay/idempotency ledger, local chat projection
+  DPAPI device keys, replay/idempotency ledger, rate limits, local chat projection
       ↓
 Hermes protected named pipe → one-use ticket → loopback WebSocket
       ↓
 Existing Hermes session, local Qwen and configured tools
 ```
 
-Tailscale is the encrypted network boundary; the per-device key is an additional
+For the original 1.2 route, Tailscale is the encrypted network boundary; the per-device key is an additional
 application boundary. A tailnet member without a valid device key cannot submit
 messages. Revocation sets the device inactive immediately, independently of
 Tailscale membership.
+
+## Public mobile route in 1.3
+
+Version 1.3 adds a dedicated HTTPS edge at `rabotyaga.viralops.ru` so the iPhone
+does not need a VPN. The existing Ubuntu Caddy instance accepts only the exact
+mobile API paths, limits request bodies and upstream timeouts, and forwards over
+the existing private Tailscale HTTPS path to the loopback-only Windows bridge.
+The public edge does not expose the health endpoint, Hermes WebSocket,
+administration, diagnostics or any other Caddy site.
+
+Every protected request still uses the per-device HMAC, timestamp and one-use
+nonce. Pairing codes remain one-use and short-lived. The bridge adds bounded
+concurrency plus separate global, source, pairing, device, message, approval and
+revocation rate limits. Device keys remain encrypted with Windows DPAPI and in
+iOS Keychain. Approval choices remain scoped and are validated by Hermes; a
+chat message is never treated as standing approval for later actions.
 
 ## API v1
 
@@ -54,7 +72,8 @@ over HTTPS and returns one device credential. All other routes require the four
 - `POST /v1/chat/approvals/{prompt_id}` — one explicit choice for one projected
   prompt and execution generation;
 - `DELETE /v1/device` — revoke the current device;
-- `GET /v1/health` — minimal liveness, no Hermes or identity metadata.
+- `GET /v1/health` — minimal private liveness, no Hermes or identity metadata;
+  the public Caddy route deliberately returns 404 for it.
 
 No endpoint can enable YOLO mode, set global approval policy, expose credentials,
 or execute an arbitrary RPC method. Missing user input never becomes approval.
@@ -73,7 +92,7 @@ immediately after relaunch. Key material remains in Keychain. While a turn is
 running the app polls the small state endpoint; backgrounding does not cancel the
 Hermes turn, and foregrounding reconciles from the server.
 
-## Tailscale deployment (requires operator approval)
+## Private Windows publication
 
 The safe publication command is deliberately not run automatically:
 
@@ -82,17 +101,18 @@ tailscale serve --bg --https=443 http://127.0.0.1:8787
 tailscale serve status
 ```
 
-Do not use `tailscale funnel`, router port forwarding, `0.0.0.0`, or a public DNS
-record. Before applying the command, confirm that the iPhone is online in the same
-tailnet. To remove publication, use the current Tailscale CLI's documented Serve
-reset command and verify `tailscale serve status` is empty.
+Do not use `tailscale funnel`, a Windows router port forwarding rule or
+`0.0.0.0`. The public DNS record terminates only at Ubuntu Caddy; Windows and the
+Hermes WebSocket stay private. Before changing Serve, preserve its current
+configuration because it may contain unrelated routes.
 
 ## Device enrollment
 
 1. Start the bridge in a foreground PowerShell window.
-2. After Tailscale Serve is explicitly enabled, create a one-time pairing code:
+2. After the private Serve route and public Caddy edge are healthy, create a
+   one-time pairing code:
    `.\scripts\hermes_gateway.ps1 -Action pair -DeviceName 'iPhone 15 Pro'`.
-3. In the app, enter only the `https://…ts.net` Serve URL and the code. Never paste
+3. In the app, enter `https://rabotyaga.viralops.ru` and the code. Never paste
    the device secret; the app receives it over HTTPS and saves it to Keychain.
 4. Send a harmless chat message, background/foreground the app, then verify that
    the real response and history remain.
