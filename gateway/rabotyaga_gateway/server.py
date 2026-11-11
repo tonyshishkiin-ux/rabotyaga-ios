@@ -5,6 +5,7 @@ import ipaddress
 import json
 import logging
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
@@ -172,10 +173,49 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        started = getattr(self, "_request_started", None)
+        if started is not None:
+            self.send_header("Server-Timing", f"gateway;dur={(time.perf_counter() - started) * 1000:.2f}")
         if retry_after is not None:
             self.send_header("Retry-After", str(retry_after))
         self.end_headers()
         self.wfile.write(body)
+
+    def _write_stream_event(self, event: dict) -> None:
+        data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+        frame = (
+            f"id: {event.get('sequence', 0)}\n"
+            f"event: {event.get('type', 'message')}\n"
+            f"data: {data}\n\n"
+        ).encode("utf-8")
+        self.wfile.write(frame)
+        self.wfile.flush()
+
+    def _stream_chat(self, device_id: str) -> None:
+        sequence, state = self.server.service.store.stream_initial_state(device_id)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Connection", "close")
+        started = getattr(self, "_request_started", None)
+        if started is not None:
+            self.send_header("Server-Timing", f"gateway;dur={(time.perf_counter() - started) * 1000:.2f}")
+        self.end_headers()
+        self.close_connection = True
+        self._write_stream_event(
+            {"sequence": sequence, "type": "state", "created_at": time.time(), "state": state}
+        )
+        while self.server.service.store.is_device_active(device_id):
+            events = self.server.service.store.wait_for_stream_events(device_id, sequence, timeout=10)
+            if not events:
+                self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+                continue
+            for event in events:
+                self._write_stream_event(event)
+                sequence = max(sequence, int(event.get("sequence") or 0))
 
     def _dispatch(self) -> None:
         path = urlsplit(self.path).path
@@ -194,6 +234,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
         device_id = self._authenticate(body)
         self._limit_device_request(device_id, path)
+        if self.command == "GET" and path == "/v1/chat/stream":
+            self._stream_chat(device_id)
+            return
         if self.command == "GET" and path == "/v1/chat":
             self._send(HTTPStatus.OK, self._await(service.state(device_id)))
             return
@@ -212,8 +255,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self._send(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def _handle(self) -> None:
+        self._request_started = time.perf_counter()
         try:
             self._dispatch()
+        except (BrokenPipeError, ConnectionResetError):
+            return
         except AuthenticationError:
             self._send(
                 HTTPStatus.UNAUTHORIZED,

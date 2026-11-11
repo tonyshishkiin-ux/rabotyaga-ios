@@ -71,6 +71,16 @@ struct SubmissionResponse: Codable {
     }
 }
 
+struct GatewayStreamEvent: Decodable {
+    let sequence: Int
+    let type: String
+    let state: ChatStateResponse?
+    let message: ChatMessage?
+    let status: String?
+    let statusText: String?
+    let approvals: [PendingApproval]?
+}
+
 struct GatewayErrorResponse: Codable {
     let error: String
     let message: String?

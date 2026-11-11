@@ -27,5 +27,13 @@ enum DecoderSmoke {
         )
         precondition(submission.requestID == "request-1")
         precondition(submission.admissionID == "admission-1")
+
+        let stream = try decoder.decode(
+            GatewayStreamEvent.self,
+            from: Data(#"{"sequence":4,"type":"message","message":{"id":"message-2","role":"assistant","text":"partial","request_id":"request-1","status":"streaming","created_at":4}}"#.utf8)
+        )
+        precondition(stream.sequence == 4)
+        precondition(stream.message?.status == "streaming")
+        precondition(stream.message?.requestID == "request-1")
     }
 }

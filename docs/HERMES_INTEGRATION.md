@@ -1,4 +1,4 @@
-# Hermes integration for Работяга iOS 1.3
+# Hermes integration for Работяга iOS 1.4
 
 ## Confirmed local interfaces
 
@@ -68,6 +68,8 @@ over HTTPS and returns one device credential. All other routes require the four
 `X-Rabotyaga-*` HMAC headers.
 
 - `GET /v1/chat` — durable message projection, task status, pending approvals;
+- `GET /v1/chat/stream` — authenticated SSE stream of real Hermes deltas, tool
+  states, approvals and reconnect snapshots;
 - `POST /v1/chat/messages` — idempotent submission with client `request_id`;
 - `POST /v1/chat/approvals/{prompt_id}` — one explicit choice for one projected
   prompt and execution generation;
@@ -80,8 +82,11 @@ or execute an arbitrary RPC method. Missing user input never becomes approval.
 
 ## Reconnect and long tasks
 
-Hermes owns the canonical transcript and task lifetime. The bridge keeps its own
-projection so HTTP polling is simple and reliable on iOS 15. On reconnect it
+Hermes owns the canonical transcript and task lifetime. Every active device has
+its own Hermes session; legacy shared mappings are rotated automatically so one
+device cannot receive another device's events or inflate its context. The bridge
+keeps a durable projection and publishes the canonical `message.delta` events as
+authenticated SSE without synthesizing a typing animation. On reconnect it
 resumes only the device's mapped Hermes session, hydrates the durable transcript,
 pending admissions and pending prompts, then continues consuming events. Client
 retries reuse the original `request_id`; Hermes' admission ledger and the bridge
@@ -89,8 +94,10 @@ database both reject duplicate work.
 
 The iOS app caches rendered messages under iOS Data Protection and restores them
 immediately after relaunch. Key material remains in Keychain. While a turn is
-running the app polls the small state endpoint; backgrounding does not cancel the
-Hermes turn, and foregrounding reconciles from the server.
+running, one long-lived SSE request replaces one-second polling and displays
+`Думает`, `Выполняет инструмент`, `Пишет ответ` and `Ожидает подтверждения` from
+real server state. Backgrounding does not cancel the Hermes turn; reconnecting
+receives a full state snapshot before new events.
 
 ## Private Windows publication
 

@@ -74,8 +74,9 @@ struct HermesChatView: View {
                     }
                     .padding(16)
                 }
-                .onChange(of: store.messages.count) { _ in scrollToBottom(proxy) }
-                .onChange(of: store.approvals.count) { _ in scrollToBottom(proxy) }
+                .onChange(of: store.streamRevision) { _ in
+                    scrollToBottom(proxy, animated: false)
+                }
                 .onAppear { scrollToBottom(proxy, animated: false) }
             }
             Divider()
@@ -216,7 +217,7 @@ struct HermesChatView: View {
         switch store.connectionStatus {
         case "ready": return "На связи"
         case "working": return store.statusText ?? "Работает"
-        case "waiting": return "Ждёт ответа"
+        case "waiting": return store.statusText ?? "Ожидает подтверждения"
         case "error": return "Ошибка"
         default: return "Нет связи"
         }

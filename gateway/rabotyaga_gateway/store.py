@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import defaultdict, deque
 from pathlib import Path
 
 from .protection import SecretProtector
@@ -28,7 +29,53 @@ class GatewayStore:
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._protector = protector
         self._lock = threading.RLock()
+        self._stream_condition = threading.Condition(self._lock)
+        self._stream_sequences: dict[str, int] = defaultdict(int)
+        self._stream_events: dict[str, deque[dict]] = defaultdict(lambda: deque(maxlen=512))
         self._migrate()
+
+    def _publish(self, device_id: str, event_type: str, **payload) -> None:
+        with self._stream_condition:
+            sequence = self._stream_sequences[device_id] + 1
+            self._stream_sequences[device_id] = sequence
+            self._stream_events[device_id].append(
+                {
+                    "sequence": sequence,
+                    "type": event_type,
+                    "created_at": time.time(),
+                    **payload,
+                }
+            )
+            self._stream_condition.notify_all()
+
+    def stream_initial_state(self, device_id: str) -> tuple[int, dict]:
+        with self._lock:
+            return self._stream_sequences[device_id], self._chat_state_locked(device_id)
+
+    def wait_for_stream_events(
+        self, device_id: str, after_sequence: int, timeout: float = 15.0
+    ) -> list[dict]:
+        deadline = time.monotonic() + max(timeout, 0.0)
+        with self._stream_condition:
+            while self._stream_sequences[device_id] <= after_sequence:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return []
+                self._stream_condition.wait(remaining)
+            events = [
+                event for event in self._stream_events[device_id]
+                if event["sequence"] > after_sequence
+            ]
+            if events and events[0]["sequence"] > after_sequence + 1:
+                return [
+                    {
+                        "sequence": self._stream_sequences[device_id],
+                        "type": "state",
+                        "created_at": time.time(),
+                        "state": self._chat_state_locked(device_id),
+                    }
+                ]
+            return events
 
     def close(self) -> None:
         with self._lock:
@@ -189,7 +236,17 @@ class GatewayStore:
                 "UPDATE devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
                 (time.time(), device_id),
             )
-        return result.rowcount == 1
+        revoked = result.rowcount == 1
+        if revoked:
+            self._publish(device_id, "revoked")
+        return revoked
+
+    def is_device_active(self, device_id: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT 1 FROM devices WHERE id = ? AND revoked_at IS NULL", (device_id,)
+            ).fetchone()
+        return row is not None
 
     def list_devices(self) -> list[dict]:
         with self._lock:
@@ -205,6 +262,15 @@ class GatewayStore:
                 (device_id,),
             ).fetchone()
         return None if row is None else row["hermes_session_id"]
+
+    def session_is_shared(self, device_id: str, session_id: str) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT COUNT(*) AS count FROM chat_sessions
+                   WHERE hermes_session_id = ? AND device_id <> ?""",
+                (session_id, device_id),
+            ).fetchone()
+        return bool(row and row["count"])
 
     def has_stale_unfinished_messages(self, device_id: str, age_seconds: float) -> bool:
         cutoff = time.time() - max(float(age_seconds), 0.0)
@@ -249,28 +315,41 @@ class GatewayStore:
             )
         self.hydrate_messages(device_id, snapshot.get("messages") or [])
         self.hydrate_approvals(device_id, snapshot.get("prompts") or [])
+        self._publish(device_id, "state", state=self.chat_state(device_id))
 
     def all_sessions(self) -> list[tuple[str, str]]:
         with self._lock:
             rows = self._connection.execute(
-                "SELECT device_id, hermes_session_id FROM chat_sessions WHERE hermes_session_id IS NOT NULL"
+                """SELECT chat_sessions.device_id, chat_sessions.hermes_session_id
+                   FROM chat_sessions JOIN devices ON devices.id = chat_sessions.device_id
+                   WHERE chat_sessions.hermes_session_id IS NOT NULL
+                     AND devices.revoked_at IS NULL"""
             ).fetchall()
         return [(row["device_id"], row["hermes_session_id"]) for row in rows]
 
     def device_for_session(self, session_id: str) -> str | None:
         with self._lock:
-            row = self._connection.execute(
-                "SELECT device_id FROM chat_sessions WHERE hermes_session_id = ?",
+            rows = self._connection.execute(
+                """SELECT chat_sessions.device_id
+                   FROM chat_sessions JOIN devices ON devices.id = chat_sessions.device_id
+                   WHERE chat_sessions.hermes_session_id = ? AND devices.revoked_at IS NULL""",
                 (session_id,),
-            ).fetchone()
-        return None if row is None else row["device_id"]
+            ).fetchall()
+        return rows[0]["device_id"] if len(rows) == 1 else None
 
     def set_status(self, device_id: str, status: str, text: str | None = None) -> None:
+        safe_text = text[:300] if text else None
         with self._lock, self._connection:
+            current = self._connection.execute(
+                "SELECT status, status_text FROM chat_sessions WHERE device_id = ?", (device_id,)
+            ).fetchone()
+            if current is not None and current["status"] == status and current["status_text"] == safe_text:
+                return
             self._connection.execute(
                 "UPDATE chat_sessions SET status = ?, status_text = ?, updated_at = ? WHERE device_id = ?",
-                (status, text[:300] if text else None, time.time(), device_id),
+                (status, safe_text, time.time(), device_id),
             )
+        self._publish(device_id, "status", status=status, status_text=safe_text)
 
     def add_user_message(self, device_id: str, request_id: str, text: str) -> dict:
         now = time.time()
@@ -290,7 +369,7 @@ class GatewayStore:
                    VALUES(?, ?, 'user', ?, ?, 'queued', ?, ?)""",
                 (message_id, device_id, text, request_id, now, now),
             )
-        return {
+        message = {
             "id": message_id,
             "device_id": device_id,
             "role": "user",
@@ -300,6 +379,8 @@ class GatewayStore:
             "created_at": now,
             "updated_at": now,
         }
+        self._publish(device_id, "message", message=self._public_message(message))
+        return message
 
     def mark_admitted(self, device_id: str, request_id: str, receipt: dict) -> None:
         with self._lock, self._connection:
@@ -314,10 +395,70 @@ class GatewayStore:
                     request_id,
                 ),
             )
-        self.set_status(device_id, "working", "Hermes обрабатывает сообщение")
+            row = self._connection.execute(
+                """SELECT id, role, text, request_id, status, created_at
+                   FROM messages WHERE device_id = ? AND request_id = ? AND role = 'user'""",
+                (device_id, request_id),
+            ).fetchone()
+        if row is not None:
+            self._publish(device_id, "message", message=dict(row))
+        self.set_status(device_id, "working", "Думает")
+
+    @staticmethod
+    def _public_message(message: dict) -> dict:
+        return {
+            key: message.get(key)
+            for key in ("id", "role", "text", "request_id", "status", "created_at")
+        }
+
+    def append_assistant_delta(self, device_id: str, admission_id: str | None, text: str) -> None:
+        if not admission_id or not text:
+            return
+        now = time.time()
+        with self._lock, self._connection:
+            user = self._connection.execute(
+                "SELECT request_id FROM messages WHERE device_id = ? AND admission_id = ? AND role = 'user'",
+                (device_id, admission_id),
+            ).fetchone()
+            request_id = None if user is None else user["request_id"]
+            row = self._connection.execute(
+                "SELECT id, text, created_at FROM messages WHERE device_id = ? AND admission_id = ? AND role = 'assistant'",
+                (device_id, admission_id),
+            ).fetchone()
+            if row is None:
+                message_id = str(uuid.uuid4())
+                created_at = now
+                combined = text
+                self._connection.execute(
+                    """INSERT INTO messages
+                       (id, device_id, role, text, request_id, admission_id, status, created_at, updated_at)
+                       VALUES(?, ?, 'assistant', ?, ?, ?, 'streaming', ?, ?)""",
+                    (message_id, device_id, combined, request_id, admission_id, created_at, now),
+                )
+            else:
+                message_id = row["id"]
+                created_at = row["created_at"]
+                combined = str(row["text"] or "") + text
+                self._connection.execute(
+                    "UPDATE messages SET text = ?, status = 'streaming', updated_at = ? WHERE id = ?",
+                    (combined, now, message_id),
+                )
+        self._publish(
+            device_id,
+            "message",
+            message={
+                "id": message_id,
+                "role": "assistant",
+                "text": combined,
+                "request_id": request_id,
+                "status": "streaming",
+                "created_at": created_at,
+            },
+        )
+        self.set_status(device_id, "working", "Пишет ответ")
 
     def complete_admission(self, device_id: str, admission_id: str | None, payload: dict) -> None:
-        text = payload.get("text")
+        text = payload.get("text") or payload.get("final_response")
         if not isinstance(text, str):
             text = json.dumps(text, ensure_ascii=False) if text is not None else ""
         status = str(payload.get("status") or "complete")
@@ -334,21 +475,44 @@ class GatewayStore:
                     (status, now, device_id, admission_id),
                 )
             existing = self._connection.execute(
-                "SELECT id FROM messages WHERE device_id = ? AND admission_id = ? AND role = 'assistant'",
+                "SELECT id, text, created_at FROM messages WHERE device_id = ? AND admission_id = ? AND role = 'assistant'",
                 (device_id, admission_id),
             ).fetchone()
             if existing:
+                final_text = text or str(existing["text"] or "")
                 self._connection.execute(
                     "UPDATE messages SET text = ?, status = ?, updated_at = ? WHERE id = ?",
-                    (text, status, now, existing["id"]),
+                    (final_text, status, now, existing["id"]),
                 )
+                message_id = existing["id"]
+                created_at = existing["created_at"]
             elif text:
+                message_id = str(uuid.uuid4())
+                created_at = now
+                final_text = text
                 self._connection.execute(
                     """INSERT INTO messages
                        (id, device_id, role, text, request_id, admission_id, status, created_at, updated_at)
                        VALUES(?, ?, 'assistant', ?, ?, ?, ?, ?, ?)""",
-                    (str(uuid.uuid4()), device_id, text, request_id, admission_id, status, now, now),
+                    (message_id, device_id, final_text, request_id, admission_id, status, now, now),
                 )
+            else:
+                message_id = None
+                created_at = now
+                final_text = ""
+        if message_id is not None:
+            self._publish(
+                device_id,
+                "message",
+                message={
+                    "id": message_id,
+                    "role": "assistant",
+                    "text": final_text,
+                    "request_id": request_id,
+                    "status": status,
+                    "created_at": created_at,
+                },
+            )
         self.set_status(device_id, "ready" if status == "complete" else "error", payload.get("error"))
 
     def hydrate_messages(self, device_id: str, messages: list[dict]) -> None:
@@ -400,6 +564,7 @@ class GatewayStore:
                     now,
                 ),
             )
+        self._publish(device_id, "approvals", approvals=self._pending_approvals(device_id))
 
     def hydrate_approvals(self, device_id: str, prompts: list[dict]) -> None:
         for prompt in prompts:
@@ -423,23 +588,39 @@ class GatewayStore:
                 "UPDATE approvals SET status = ?, updated_at = ? WHERE device_id = ? AND prompt_id = ?",
                 (status, time.time(), device_id, prompt_id),
             )
+        self._publish(device_id, "approvals", approvals=self._pending_approvals(device_id))
 
-    def chat_state(self, device_id: str) -> dict:
+    def _pending_approvals(self, device_id: str) -> list[dict]:
         with self._lock:
-            session = self._connection.execute(
-                "SELECT hermes_session_id, status, status_text, updated_at FROM chat_sessions WHERE device_id = ?",
-                (device_id,),
-            ).fetchone()
-            messages = self._connection.execute(
-                """SELECT id, role, text, request_id, status, created_at
-                   FROM messages WHERE device_id = ? ORDER BY created_at, id""",
-                (device_id,),
-            ).fetchall()
-            approvals = self._connection.execute(
+            rows = self._connection.execute(
                 """SELECT prompt_id, kind, title, command, choices_json, created_at
                    FROM approvals WHERE device_id = ? AND status = 'pending' ORDER BY created_at""",
                 (device_id,),
             ).fetchall()
+        return [
+            {**dict(row), "choices": json.loads(row["choices_json"])}
+            for row in rows
+        ]
+
+    def chat_state(self, device_id: str) -> dict:
+        with self._lock:
+            return self._chat_state_locked(device_id)
+
+    def _chat_state_locked(self, device_id: str) -> dict:
+        session = self._connection.execute(
+            "SELECT hermes_session_id, status, status_text, updated_at FROM chat_sessions WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        messages = self._connection.execute(
+            """SELECT id, role, text, request_id, status, created_at
+               FROM messages WHERE device_id = ? ORDER BY created_at, id""",
+            (device_id,),
+        ).fetchall()
+        approvals = self._connection.execute(
+            """SELECT prompt_id, kind, title, command, choices_json, created_at
+               FROM approvals WHERE device_id = ? AND status = 'pending' ORDER BY created_at""",
+            (device_id,),
+        ).fetchall()
         return {
             "session_id": None if session is None else session["hermes_session_id"],
             "status": "connecting" if session is None else session["status"],

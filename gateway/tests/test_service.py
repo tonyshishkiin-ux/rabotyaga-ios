@@ -108,6 +108,43 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["messages"][-1]["text"], "Настоящий ответ Hermes")
         self.assertEqual(state["status"], "ready")
 
+    async def test_delta_is_visible_before_completion(self) -> None:
+        request_id = "12345678-1234-1234-1234-123456789abc"
+        result = await self.service.submit(
+            self.device_id, {"request_id": request_id, "text": "Потоковый ответ"}
+        )
+
+        self.store.append_assistant_delta(self.device_id, result["admission_id"], "Первая ")
+        self.store.append_assistant_delta(self.device_id, result["admission_id"], "часть")
+
+        streaming = self.store.chat_state(self.device_id)
+        self.assertEqual(streaming["messages"][-1]["text"], "Первая часть")
+        self.assertEqual(streaming["messages"][-1]["status"], "streaming")
+        self.assertEqual(streaming["status_text"], "Пишет ответ")
+
+        self.store.complete_admission(
+            self.device_id,
+            result["admission_id"],
+            {"text": "Первая часть готова", "status": "complete"},
+        )
+        complete = self.store.chat_state(self.device_id)
+        self.assertEqual(complete["messages"][-1]["text"], "Первая часть готова")
+        self.assertEqual(complete["messages"][-1]["status"], "complete")
+        self.assertEqual(complete["status"], "ready")
+
+    async def test_stream_events_resume_from_sequence(self) -> None:
+        sequence, state = self.store.stream_initial_state(self.device_id)
+        self.assertEqual(state["messages"], [])
+
+        request_id = "12345678-1234-1234-1234-123456789abc"
+        await self.service.submit(self.device_id, {"request_id": request_id, "text": "Привет"})
+        events = self.store.wait_for_stream_events(self.device_id, sequence, timeout=0)
+
+        self.assertTrue(events)
+        self.assertEqual([event["sequence"] for event in events], sorted(event["sequence"] for event in events))
+        self.assertIn("message", {event["type"] for event in events})
+        self.assertIn("status", {event["type"] for event in events})
+
     async def test_stale_queued_message_is_reconciled_from_hermes(self) -> None:
         request_id = "12345678-1234-1234-1234-123456789abc"
         await self.service.submit(
@@ -268,6 +305,56 @@ class TransportReconciliationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([row["role"] for row in state["messages"]], ["user", "assistant"])
                 self.assertEqual(state["messages"][-1]["text"], "Ответ восстановлен из квитанции")
                 self.assertEqual(state["status"], "ready")
+            finally:
+                store.close()
+
+    async def test_shared_legacy_session_rotates_to_device_specific_title(self) -> None:
+        temporary_root = Path(__file__).parent / ".tmp"
+        temporary_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=temporary_root) as temporary:
+            store = GatewayStore(Path(temporary) / "test.db", PlaintextProtector())
+            try:
+                devices = []
+                for name in ("iPhone", "Legacy benchmark"):
+                    code = store.create_pairing_code(name)
+                    device_id, _ = store.consume_pairing_code(code)
+                    devices.append(device_id)
+                    store.set_hermes_session(
+                        device_id,
+                        "legacy-shared-session",
+                        {
+                            "stored_session_id": "legacy-shared-session",
+                            "running": False,
+                            "messages": [],
+                            "prompts": [],
+                        },
+                    )
+
+                transport = HermesGatewayTransport(store, Path(temporary))
+                calls = []
+
+                async def no_start() -> None:
+                    return None
+
+                async def fake_rpc(method: str, **params) -> dict:
+                    calls.append((method, params))
+                    self.assertEqual(method, "session.create")
+                    return {
+                        "stored_session_id": "isolated-session",
+                        "running": False,
+                        "messages": [],
+                        "prompts": [],
+                    }
+
+                transport.start = no_start
+                transport._rpc = fake_rpc
+
+                result = await transport.ensure_session(devices[0])
+
+                self.assertEqual(result, "isolated-session")
+                self.assertEqual(calls[0][1]["title"], f"Работяга iOS · {devices[0][:8]}")
+                self.assertEqual(store.hermes_session_id(devices[0]), "isolated-session")
+                self.assertEqual(store.hermes_session_id(devices[1]), "legacy-shared-session")
             finally:
                 store.close()
 

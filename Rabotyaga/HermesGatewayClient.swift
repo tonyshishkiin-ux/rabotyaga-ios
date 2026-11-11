@@ -50,7 +50,7 @@ struct HermesGatewayClient {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.waitsForConnectivity = true
         configuration.timeoutIntervalForRequest = 30
-        configuration.timeoutIntervalForResource = 300
+        configuration.timeoutIntervalForResource = 86_400
         session = URLSession(configuration: configuration)
         decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -98,6 +98,60 @@ struct HermesGatewayClient {
 
     func fetchState() async throws -> ChatStateResponse {
         try await authenticatedRequest(path: "/v1/chat", method: "GET", body: Data())
+    }
+
+    func streamEvents() throws -> AsyncThrowingStream<GatewayStreamEvent, Error> {
+        guard let rawURL = UserDefaults.standard.string(forKey: Self.gatewayURLKey),
+              let credentials = try keychain.load() else {
+            throw GatewayClientError.notConfigured
+        }
+        let baseURL = try normalizedBaseURL(rawURL)
+        let path = "/v1/chat/stream"
+        guard let url = URL(string: path, relativeTo: baseURL)?.absoluteURL else {
+            throw GatewayClientError.invalidURL
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+        sign(&request, body: Data(), path: path, credentials: credentials)
+
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let (bytes, response) = try await session.bytes(for: request)
+                    guard let http = response as? HTTPURLResponse else {
+                        throw GatewayClientError.invalidResponse
+                    }
+                    guard (200..<300).contains(http.statusCode) else {
+                        throw GatewayClientError.server(
+                            http.statusCode,
+                            "Поток Hermes вернул ошибку \(http.statusCode)"
+                        )
+                    }
+                    var dataLines: [String] = []
+                    for try await line in bytes.lines {
+                        try Task.checkCancellation()
+                        if line.isEmpty {
+                            guard !dataLines.isEmpty else { continue }
+                            let data = Data(dataLines.joined(separator: "\n").utf8)
+                            continuation.yield(try decoder.decode(GatewayStreamEvent.self, from: data))
+                            dataLines.removeAll(keepingCapacity: true)
+                        } else if line.hasPrefix("data:") {
+                            dataLines.append(String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces))
+                        }
+                    }
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch let error as URLError {
+                    continuation.finish(throwing: mapped(error))
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 
     func submit(text: String, requestID: String) async throws -> SubmissionResponse {
@@ -175,21 +229,7 @@ struct HermesGatewayClient {
         do {
             (data, response) = try await session.data(for: request)
         } catch let error as URLError {
-            switch error.code {
-            case .notConnectedToInternet, .dataNotAllowed, .internationalRoamingOff:
-                throw GatewayClientError.networkUnavailable
-            case .timedOut:
-                throw GatewayClientError.timedOut
-            case .secureConnectionFailed, .serverCertificateHasBadDate,
-                 .serverCertificateUntrusted, .serverCertificateHasUnknownRoot,
-                 .serverCertificateNotYetValid, .clientCertificateRejected:
-                throw GatewayClientError.tlsValidationFailed
-            case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
-                 .networkConnectionLost:
-                throw GatewayClientError.cannotReachGateway
-            default:
-                throw error
-            }
+            throw mapped(error)
         }
         guard let http = response as? HTTPURLResponse else { throw GatewayClientError.invalidResponse }
         guard (200..<300).contains(http.statusCode) else {
@@ -203,6 +243,24 @@ struct HermesGatewayClient {
             return try decoder.decode(Response.self, from: data)
         } catch {
             throw GatewayClientError.invalidResponse
+        }
+    }
+
+    private func mapped(_ error: URLError) -> Error {
+        switch error.code {
+        case .notConnectedToInternet, .dataNotAllowed, .internationalRoamingOff:
+            return GatewayClientError.networkUnavailable
+        case .timedOut:
+            return GatewayClientError.timedOut
+        case .secureConnectionFailed, .serverCertificateHasBadDate,
+             .serverCertificateUntrusted, .serverCertificateHasUnknownRoot,
+             .serverCertificateNotYetValid, .clientCertificateRejected:
+            return GatewayClientError.tlsValidationFailed
+        case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
+             .networkConnectionLost:
+            return GatewayClientError.cannotReachGateway
+        default:
+            return error
         }
     }
 

@@ -102,6 +102,9 @@ class HermesGatewayTransport:
     async def _reattach_sessions(self) -> None:
         for device_id, session_id in self.store.all_sessions():
             try:
+                if self.store.session_is_shared(device_id, session_id):
+                    await self.ensure_session(device_id)
+                    continue
                 snapshot = await self._rpc("session.resume", session_id=session_id)
                 self.store.set_hermes_session(device_id, snapshot["stored_session_id"], snapshot)
             except Exception as exc:
@@ -125,11 +128,21 @@ class HermesGatewayTransport:
             admission_id = params.get("admission_id") or payload.get("admission_id")
             if event_type == "message.complete":
                 self.store.complete_admission(device_id, admission_id, payload)
+            elif event_type == "message.delta":
+                text = payload.get("text") or payload.get("content") or ""
+                if isinstance(text, str):
+                    self.store.append_assistant_delta(device_id, admission_id, text)
+            elif event_type == "message.interim":
+                text = payload.get("text") or payload.get("content") or ""
+                if isinstance(text, str) and text and not payload.get("already_streamed"):
+                    self.store.append_assistant_delta(device_id, admission_id, text + "\n\n")
             elif event_type == "status.update":
-                self.store.set_status(device_id, "working", str(payload.get("text") or ""))
+                self.store.set_status(device_id, "working", str(payload.get("text") or "Думает"))
             elif event_type in {"tool.start", "tool.generating"}:
-                name = payload.get("name") or "инструмент"
-                self.store.set_status(device_id, "working", f"Hermes использует: {name}")
+                name = payload.get("tool_name") or payload.get("name") or "инструмент"
+                self.store.set_status(device_id, "working", f"Выполняет инструмент: {name}")
+            elif event_type == "tool.complete":
+                self.store.set_status(device_id, "working", "Думает")
             elif event_type == "approval.request":
                 self.store.upsert_approval(
                     device_id,
@@ -139,7 +152,7 @@ class HermesGatewayTransport:
                         "execution_generation": params.get("execution_generation"),
                     },
                 )
-                self.store.set_status(device_id, "waiting", "Hermes ждёт подтверждения")
+                self.store.set_status(device_id, "waiting", "Ожидает подтверждения")
             elif event_type == "clarify.request":
                 self.store.upsert_approval(
                     device_id,
@@ -167,19 +180,19 @@ class HermesGatewayTransport:
     async def ensure_session(self, device_id: str) -> str:
         await self.start()
         existing = self.store.hermes_session_id(device_id)
-        if existing:
+        if existing and not self.store.session_is_shared(device_id, existing):
             return existing
         lock = self._create_locks.setdefault(device_id, asyncio.Lock())
         async with lock:
             existing = self.store.hermes_session_id(device_id)
-            if existing:
+            if existing and not self.store.session_is_shared(device_id, existing):
                 return existing
             request_id = uuid.uuid4().hex
             snapshot = await self._rpc(
                 "session.create",
                 request_id=request_id,
                 source="gui",
-                title="Работяга iOS",
+                title=f"Работяга iOS · {device_id[:8]}",
                 safe_mode=False,
                 yolo=False,
             )

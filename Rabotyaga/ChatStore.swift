@@ -9,11 +9,12 @@ final class ChatStore: ObservableObject {
     @Published private(set) var isRefreshing = false
     @Published private(set) var isSending = false
     @Published private(set) var isConfigured = false
+    @Published private(set) var streamRevision = 0
     @Published var errorMessage: String?
 
     private let client = HermesGatewayClient()
-    private var pollingTask: Task<Void, Never>?
-    private var reconnectTask: Task<Void, Never>?
+    private var streamTask: Task<Void, Never>?
+    private var cacheTask: Task<Void, Never>?
     private var failedSubmission: (id: String, text: String)?
 
     init() {
@@ -22,8 +23,8 @@ final class ChatStore: ObservableObject {
     }
 
     deinit {
-        pollingTask?.cancel()
-        reconnectTask?.cancel()
+        streamTask?.cancel()
+        cacheTask?.cancel()
     }
 
     func refresh(showActivity: Bool = true) async {
@@ -33,15 +34,13 @@ final class ChatStore: ObservableObject {
         do {
             let state = try await client.fetchState()
             apply(state)
-            if showActivity && (state.status == "working" || state.status == "connecting") {
-                startPolling()
-            }
+            startStreaming()
             errorMessage = nil
         } catch {
             connectionStatus = "offline"
             statusText = "Нет связи со шлюзом"
             if showActivity { errorMessage = error.localizedDescription }
-            scheduleReconnect()
+            startStreaming()
         }
     }
 
@@ -75,8 +74,13 @@ final class ChatStore: ObservableObject {
         do {
             _ = try await client.submit(text: text, requestID: requestID)
             failedSubmission = nil
-            await refresh(showActivity: false)
-            startPolling()
+            if let index = messages.firstIndex(where: { $0.requestID == requestID && $0.role == .user }) {
+                messages[index].status = "queued"
+            }
+            connectionStatus = "working"
+            statusText = "Думает"
+            scheduleCache()
+            startStreaming()
         } catch {
             failedSubmission = (requestID, text)
             if let index = messages.firstIndex(where: { $0.requestID == requestID && $0.role == .user }) {
@@ -99,8 +103,9 @@ final class ChatStore: ObservableObject {
                 requestID: UUID().uuidString.lowercased()
             )
             approvals.removeAll { $0.id == approval.id }
-            await refresh(showActivity: false)
-            startPolling()
+            connectionStatus = "working"
+            statusText = "Думает"
+            startStreaming()
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -150,52 +155,39 @@ final class ChatStore: ObservableObject {
     }
 
     private func disconnectLocally() {
-        pollingTask?.cancel()
-        reconnectTask?.cancel()
-        reconnectTask = nil
+        streamTask?.cancel()
+        cacheTask?.cancel()
+        streamTask = nil
         isConfigured = false
         connectionStatus = "offline"
         statusText = nil
         approvals = []
     }
 
-    private func startPolling() {
-        pollingTask?.cancel()
-        pollingTask = Task { [weak self] in
-            for _ in 0..<300 {
-                guard let self, !Task.isCancelled else { return }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                await self.refresh(showActivity: false)
-                if self.connectionStatus == "ready" || self.connectionStatus == "error" || !self.approvals.isEmpty {
-                    return
-                }
-            }
-        }
-    }
-
-    private func scheduleReconnect() {
-        guard isConfigured, reconnectTask == nil else { return }
-        reconnectTask = Task { [weak self] in
-            var delay: UInt64 = 2
-            while let self, !Task.isCancelled, self.isConfigured {
-                try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
-                guard !Task.isCancelled else { return }
+    private func startStreaming() {
+        guard isConfigured, streamTask == nil else { return }
+        streamTask = Task { [weak self] in
+            var delay: UInt64 = 1
+            while let self, self.isConfigured, !Task.isCancelled {
                 do {
-                    let state = try await self.client.fetchState()
-                    self.apply(state)
-                    self.errorMessage = nil
-                    self.reconnectTask = nil
-                    if state.status == "working" || state.status == "connecting" {
-                        self.startPolling()
+                    let events = try self.client.streamEvents()
+                    for try await event in events {
+                        guard !Task.isCancelled else { return }
+                        self.apply(event)
+                        self.errorMessage = nil
+                        delay = 1
                     }
+                } catch is CancellationError {
                     return
                 } catch {
                     self.connectionStatus = "offline"
                     self.statusText = "Переподключение…"
-                    delay = min(delay * 2, 30)
                 }
+                guard !Task.isCancelled, self.isConfigured else { return }
+                try? await Task.sleep(nanoseconds: delay * 1_000_000_000)
+                delay = min(delay * 2, 30)
             }
-            self?.reconnectTask = nil
+            self?.streamTask = nil
         }
     }
 
@@ -205,6 +197,54 @@ final class ChatStore: ObservableObject {
         connectionStatus = state.status
         statusText = state.statusText
         Self.cache(messages)
+        streamRevision += 1
+    }
+
+    private func apply(_ event: GatewayStreamEvent) {
+        switch event.type {
+        case "state":
+            if let state = event.state { apply(state) }
+        case "message":
+            if let message = event.message { apply(message) }
+        case "status":
+            connectionStatus = event.status ?? connectionStatus
+            statusText = event.statusText
+        case "approvals":
+            approvals = event.approvals ?? []
+            streamRevision += 1
+        case "revoked":
+            disconnectLocally()
+        default:
+            break
+        }
+    }
+
+    private func apply(_ message: ChatMessage) {
+        if let index = messages.firstIndex(where: { $0.id == message.id }) {
+            messages[index] = message
+        } else if let requestID = message.requestID,
+                  let index = messages.firstIndex(where: {
+                      $0.requestID == requestID && $0.role == message.role
+                  }) {
+            messages[index] = message
+        } else {
+            messages.append(message)
+        }
+        if message.role == .assistant && message.status == "streaming" {
+            connectionStatus = "working"
+            statusText = "Пишет ответ"
+        }
+        streamRevision += 1
+        scheduleCache()
+    }
+
+    private func scheduleCache() {
+        cacheTask?.cancel()
+        cacheTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard let self, !Task.isCancelled else { return }
+            Self.cache(self.messages)
+        }
     }
 
     private static var cacheURL: URL? {
