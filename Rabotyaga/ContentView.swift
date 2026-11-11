@@ -34,7 +34,7 @@ struct ContentView: View {
     @AppStorage("shabashka.decisions.v1") private var decisionsJSON = "{}"
     @SceneStorage("selectedTab.v1") private var selectedTab = AppTab.chat.rawValue
     @State private var selectedOpportunity: Opportunity?
-    @State private var message = ""
+    @StateObject private var chatStore = ChatStore()
 
     private var decisions: [String: OpportunityDecision] {
         guard let data = decisionsJSON.data(using: .utf8),
@@ -110,42 +110,9 @@ struct ContentView: View {
     }
 
     private var chatTab: some View {
-        NavigationView {
-            VStack(spacing: 20) {
-                Spacer()
-                Image(systemName: "bolt.fill")
-                    .font(.system(size: 44, weight: .bold))
-                    .foregroundColor(Color.accentColor)
-                    .accessibilityHidden(true)
-                Text("Привет, начальник!")
-                    .font(.largeTitle.bold())
-                    .multilineTextAlignment(.center)
-                Text("Работяга на связи с приложением. Подключение к Hermes Agent появится на следующем этапе.")
-                    .foregroundColor(.secondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal)
-                Label("Hermes пока не подключён", systemImage: "wifi.slash")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                Spacer()
-                HStack(spacing: 12) {
-                    TextField("Сообщение Работяге", text: $message)
-                        .textFieldStyle(.roundedBorder)
-                        .disabled(true)
-                        .accessibilityHint("Станет доступно после подключения Hermes")
-                    Button(action: {}) {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.title2)
-                            .frame(width: 44, height: 44)
-                    }
-                    .disabled(true)
-                    .accessibilityLabel("Отправить сообщение")
-                }
-                .padding()
-            }
-            .navigationTitle("Работяга")
+        HermesChatView(store: chatStore) {
+            selectedTab = AppTab.settings.rawValue
         }
-        .navigationViewStyle(.stack)
     }
 
     private var opportunitiesTab: some View {
@@ -381,29 +348,6 @@ struct ContentView: View {
     }
 
     private var settingsTab: some View {
-        NavigationView {
-            List {
-                Section("Подключение") {
-                    Label("Hermes Agent: не подключён", systemImage: "wifi.slash")
-                        .foregroundColor(.secondary)
-                    Text("Следующим этапом станет защищённое подключение к работающему агенту.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                }
-                Section("О приложении") {
-                    HStack {
-                        Text("Версия")
-                        Spacer()
-                        Text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0")
-                            .foregroundColor(.secondary)
-                    }
-                    Text("Шабашка работает в демонстрационном режиме, без внешних запросов и отправки откликов.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                }
-            }
-            .navigationTitle("Настройки")
-        }
-        .navigationViewStyle(.stack)
+        ConnectionSettingsView(store: chatStore)
     }
 }

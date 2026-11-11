@@ -2,6 +2,9 @@
 build/
 DerivedData/
 artifacts/
+gateway/tests/.tmp/
+__pycache__/
+*.pyc
 *.xcuserstate
 xcuserdata/
 
