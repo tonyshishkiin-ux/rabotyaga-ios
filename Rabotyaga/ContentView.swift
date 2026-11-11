@@ -22,8 +22,17 @@ private enum OpportunityDecision: String, Codable {
     case saved
 }
 
+private enum AppTab: String {
+    case chat
+    case opportunities
+    case tasks
+    case settings
+}
+
 struct ContentView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage("shabashka.decisions.v1") private var decisionsJSON = "{}"
+    @SceneStorage("selectedTab.v1") private var selectedTab = AppTab.chat.rawValue
     @State private var selectedOpportunity: Opportunity?
     @State private var message = ""
 
@@ -52,26 +61,48 @@ struct ContentView: View {
         updated[opportunity.id] = decision
         guard let encoded = try? JSONEncoder().encode(updated),
               let text = String(data: encoded, encoding: .utf8) else { return }
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
             decisionsJSON = text
         }
     }
 
+    private func resetDecisions() {
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+            decisionsJSON = "{}"
+        }
+    }
+
+    private func handleSwipe(_ value: DragGesture.Value, for opportunity: Opportunity) {
+        let horizontalDistance = value.translation.width
+        let verticalDistance = value.translation.height
+
+        guard abs(horizontalDistance) > 90,
+              abs(horizontalDistance) > abs(verticalDistance) * 1.25 else {
+            return
+        }
+
+        decide(horizontalDistance > 0 ? .interested : .passed, for: opportunity)
+    }
+
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             chatTab
                 .tabItem { Label("Чат", systemImage: "message.fill") }
+                .tag(AppTab.chat.rawValue)
 
             opportunitiesTab
                 .tabItem { Label("Шабашка", systemImage: "briefcase.fill") }
+                .tag(AppTab.opportunities.rawValue)
 
             tasksTab
                 .tabItem { Label("Задачи", systemImage: "checklist") }
+                .tag(AppTab.tasks.rawValue)
 
             settingsTab
                 .tabItem { Label("Настройки", systemImage: "gearshape.fill") }
+                .tag(AppTab.settings.rawValue)
         }
-        .tint(.orange)
+        .tint(Color.accentColor)
         .preferredColorScheme(.dark)
         .sheet(item: $selectedOpportunity) { opportunity in
             opportunityDetails(opportunity)
@@ -84,7 +115,7 @@ struct ContentView: View {
                 Spacer()
                 Image(systemName: "bolt.fill")
                     .font(.system(size: 44, weight: .bold))
-                    .foregroundColor(.orange)
+                    .foregroundColor(Color.accentColor)
                     .accessibilityHidden(true)
                 Text("Привет, начальник!")
                     .font(.largeTitle.bold())
@@ -105,6 +136,7 @@ struct ContentView: View {
                     Button(action: {}) {
                         Image(systemName: "arrow.up.circle.fill")
                             .font(.title2)
+                            .frame(width: 44, height: 44)
                     }
                     .disabled(true)
                     .accessibilityLabel("Отправить сообщение")
@@ -130,22 +162,24 @@ struct ContentView: View {
 
                     if let opportunity = nextOpportunity {
                         opportunityCard(opportunity)
-                            .gesture(
+                            .simultaneousGesture(
                                 DragGesture(minimumDistance: 40)
                                     .onEnded { value in
-                                        if value.translation.width > 90 {
-                                            decide(.interested, for: opportunity)
-                                        } else if value.translation.width < -90 {
-                                            decide(.passed, for: opportunity)
-                                        }
+                                        handleSwipe(value, for: opportunity)
                                     }
                             )
                             .accessibilityHint("Свайп вправо: интересно. Влево: пропустить.")
-                        HStack(spacing: 22) {
+                            .accessibilityAction(named: Text("Отметить как интересно")) {
+                                decide(.interested, for: opportunity)
+                            }
+                            .accessibilityAction(named: Text("Пропустить заказ")) {
+                                decide(.passed, for: opportunity)
+                            }
+                        HStack(spacing: 12) {
                             decisionButton("Пропустить", icon: "xmark", color: .red) {
                                 decide(.passed, for: opportunity)
                             }
-                            decisionButton("Сохранить", icon: "bookmark.fill", color: .yellow) {
+                            decisionButton("Сохранить", icon: "bookmark.fill", color: Color.accentColor) {
                                 decide(.saved, for: opportunity)
                             }
                             decisionButton("Интересно", icon: "heart.fill", color: .green) {
@@ -164,10 +198,10 @@ struct ContentView: View {
                                 .foregroundColor(.secondary)
                                 .multilineTextAlignment(.center)
                             Button("Начать демонстрацию заново") {
-                                withAnimation { decisionsJSON = "{}" }
+                                resetDecisions()
                             }
                             .buttonStyle(.borderedProminent)
-                            .tint(.orange)
+                            .tint(Color.accentColor)
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 56)
@@ -187,11 +221,11 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
                 Label("Подходит по специализации", systemImage: "checkmark.seal.fill")
-                    .font(.caption.weight(.semibold))
+                    .font(.footnote.weight(.semibold))
                     .foregroundColor(.green)
                 Spacer(minLength: 0)
                 Text("ДЕМО")
-                    .font(.caption2.bold())
+                    .font(.footnote.bold())
                     .foregroundColor(.secondary)
             }
             Text(opportunity.title)
@@ -199,7 +233,7 @@ struct ContentView: View {
                 .fixedSize(horizontal: false, vertical: true)
             Text(opportunity.budget)
                 .font(.title.bold())
-                .foregroundColor(.orange)
+                .foregroundColor(Color.accentColor)
             Text(opportunity.description)
                 .font(.body)
                 .fixedSize(horizontal: false, vertical: true)
@@ -212,9 +246,9 @@ struct ContentView: View {
                 HStack {
                     ForEach(opportunity.tags, id: \.self) { tag in
                         Text(tag)
-                            .font(.caption)
+                            .font(.footnote)
                             .padding(.horizontal, 10)
-                            .padding(.vertical, 7)
+                            .padding(.vertical, 8)
                             .background(Color.secondary.opacity(0.16), in: Capsule())
                     }
                 }
@@ -227,7 +261,7 @@ struct ContentView: View {
         }
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 24))
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 20))
     }
 
     private func decisionButton(_ title: String, icon: String, color: Color, action: @escaping () -> Void) -> some View {
@@ -235,16 +269,28 @@ struct ContentView: View {
             VStack(spacing: 6) {
                 Image(systemName: icon)
                     .font(.title2.bold())
-                    .frame(width: 58, height: 58)
+                    .frame(width: 56, height: 56)
                     .background(color.opacity(0.16), in: Circle())
                 Text(title)
-                    .font(.caption)
+                    .font(.footnote)
             }
             .foregroundColor(color)
         }
         .buttonStyle(.plain)
         .frame(minWidth: 76, minHeight: 88)
         .accessibilityLabel(title)
+        .accessibilityHint(decisionHint(for: title))
+    }
+
+    private func decisionHint(for title: String) -> String {
+        switch title {
+        case "Пропустить":
+            return "Убирает карточку из текущей демонстрации"
+        case "Сохранить":
+            return "Добавляет заказ в раздел Задачи, Отложено"
+        default:
+            return "Добавляет заказ в раздел Задачи, Интересно"
+        }
     }
 
     private func opportunityDetails(_ opportunity: Opportunity) -> some View {
@@ -255,7 +301,7 @@ struct ContentView: View {
                         .font(.title.bold())
                     Text(opportunity.budget)
                         .font(.title2.weight(.semibold))
-                        .foregroundColor(.orange)
+                        .foregroundColor(Color.accentColor)
                     Text(opportunity.description)
                     Text("Оценка Работяги")
                         .font(.headline)
@@ -296,6 +342,7 @@ struct ContentView: View {
                         } label: {
                             opportunityRow(opportunity)
                         }
+                        .accessibilityHint("Открывает подробности заказа")
                     }
                 }
                 Section("Отложено · \(saved.count)") {
@@ -309,6 +356,7 @@ struct ContentView: View {
                         } label: {
                             opportunityRow(opportunity)
                         }
+                        .accessibilityHint("Открывает подробности заказа")
                     }
                 }
                 Section {

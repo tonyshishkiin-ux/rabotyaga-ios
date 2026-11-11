@@ -1,19 +1,24 @@
 appId: ru.rabotyaga.app
-name: Rabotyaga first-launch smoke test
+name: Rabotyaga Shabashka MVP smoke test
 tags:
   - smoke
 ---
 - launchApp:
     clearState: true
 - assertVisible: "Привет, начальник!"
-- assertVisible:
-    text: "Проверить Работягу"
-    enabled: true
-- assertVisible: "Версия 1.0"
-- assertNotVisible: "Первое приложение работает"
-- tapOn: "Проверить Работягу"
-- assertVisible: "Первое приложение работает"
+- assertVisible: "Hermes пока не подключён"
+- tapOn: "Шабашка"
+- assertVisible: "Демонстрационные заказы.*"
+- assertVisible: "Telegram-бот для записи клиентов"
+- tapOn: "Сохранить"
+- assertVisible: "Mini App с каталогом и оплатой"
+- tapOn: "Задачи"
+- assertVisible: "Отложено · 1"
+- tapOn: "Telegram-бот для записи клиентов"
+- assertVisible: "Источник: Демонстрационный заказ"
+- tapOn: "Закрыть"
 - stopApp
 - launchApp
-- assertVisible: "Привет, начальник!"
-- assertVisible: "Проверить Работягу"
+- tapOn: "Задачи"
+- assertVisible: "Отложено · 1"
+- assertVisible: "Telegram-бот для записи клиентов"
