@@ -198,6 +198,79 @@ class TransportReconciliationTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 store.close()
 
+    async def test_reconcile_reads_terminal_receipt_without_resubmitting(self) -> None:
+        temporary_root = Path(__file__).parent / ".tmp"
+        temporary_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=temporary_root) as temporary:
+            store = GatewayStore(Path(temporary) / "test.db", PlaintextProtector())
+            try:
+                code = store.create_pairing_code("Test iPhone")
+                device_id, _ = store.consume_pairing_code(code)
+                session_id = "test-hermes-session"
+                store.set_hermes_session(
+                    device_id,
+                    session_id,
+                    {
+                        "stored_session_id": session_id,
+                        "running": False,
+                        "replay_epoch": "before",
+                        "last_sequence": 1,
+                        "messages": [],
+                        "prompts": [],
+                    },
+                )
+                request_id = "12345678-1234-1234-1234-123456789abc"
+                store.add_user_message(device_id, request_id, "Проверка квитанции")
+                store.mark_admitted(
+                    device_id,
+                    request_id,
+                    {"admission_id": "admission-1", "status": "queued"},
+                )
+                with store._lock, store._connection:
+                    store._connection.execute(
+                        "UPDATE messages SET updated_at = updated_at - 60 WHERE request_id = ?",
+                        (request_id,),
+                    )
+
+                transport = HermesGatewayTransport(store, Path(temporary))
+                calls = []
+
+                async def no_start() -> None:
+                    return None
+
+                async def fake_rpc(method: str, **params) -> dict:
+                    calls.append((method, params))
+                    if method == "session.resume":
+                        return {
+                            "stored_session_id": session_id,
+                            "running": False,
+                            "replay_epoch": "after",
+                            "last_sequence": 2,
+                            "messages": [],
+                            "prompts": [],
+                        }
+                    self.assertEqual(method, "prompt.receipt")
+                    self.assertTrue(params["include_result"])
+                    return {
+                        "admission_id": "admission-1",
+                        "status": "terminal",
+                        "outcome": "completed",
+                        "result": {"final_response": "Ответ восстановлен из квитанции"},
+                    }
+
+                transport.start = no_start
+                transport._rpc = fake_rpc
+
+                await transport.reconcile(device_id)
+
+                self.assertEqual([call[0] for call in calls], ["session.resume", "prompt.receipt"])
+                state = store.chat_state(device_id)
+                self.assertEqual([row["role"] for row in state["messages"]], ["user", "assistant"])
+                self.assertEqual(state["messages"][-1]["text"], "Ответ восстановлен из квитанции")
+                self.assertEqual(state["status"], "ready")
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

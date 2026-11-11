@@ -9,7 +9,7 @@ from .store import GatewayStore, StoreError
 
 
 REQUEST_ID = re.compile(r"^[A-Za-z0-9-]{16,80}$")
-RECONCILE_QUEUED_AFTER_SECONDS = 10
+RECONCILE_UNFINISHED_AFTER_SECONDS = 10
 logger = logging.getLogger(__name__)
 
 
@@ -24,7 +24,7 @@ class GatewayService:
 
     async def state(self, device_id: str) -> dict:
         await self.hermes.ensure_session(device_id)
-        if self.store.has_stale_queued_messages(device_id, RECONCILE_QUEUED_AFTER_SECONDS):
+        if self.store.has_stale_unfinished_messages(device_id, RECONCILE_UNFINISHED_AFTER_SECONDS):
             try:
                 await self.hermes.reconcile(device_id)
             except Exception as exc:

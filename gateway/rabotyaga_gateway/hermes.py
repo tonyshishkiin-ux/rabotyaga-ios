@@ -199,6 +199,38 @@ class HermesGatewayTransport:
             snapshot = await self._rpc("session.resume", session_id=session_id)
             resumed_id = str(snapshot.get("stored_session_id") or session_id)
             self.store.set_hermes_session(device_id, resumed_id, snapshot)
+            for admission_id in self.store.stale_unfinished_admissions(device_id, 10):
+                receipt = await self._rpc(
+                    "prompt.receipt",
+                    session_id=resumed_id,
+                    admission_id=admission_id,
+                    include_result=True,
+                )
+                status = str(receipt.get("status") or "")
+                if status == "terminal":
+                    result = receipt.get("result") or {}
+                    outcome = str(receipt.get("outcome") or "failed")
+                    completed = outcome == "completed"
+                    self.store.complete_admission(
+                        device_id,
+                        admission_id,
+                        {
+                            "text": str(result.get("final_response") or ""),
+                            "status": "complete" if completed else "failed",
+                            "error": None if completed else "Hermes не завершил ответ",
+                        },
+                    )
+                elif status in {"queued", "started"}:
+                    self.store.set_status(device_id, "working", "Hermes обрабатывает сообщение")
+                elif status == "unknown":
+                    self.store.complete_admission(
+                        device_id,
+                        admission_id,
+                        {
+                            "status": "failed",
+                            "error": "Hermes потерял выполнение после перезапуска; сообщение не отправлено повторно",
+                        },
+                    )
             self._last_reconcile[device_id] = loop.time()
 
     async def submit(self, device_id: str, request_id: str, text: str) -> dict:

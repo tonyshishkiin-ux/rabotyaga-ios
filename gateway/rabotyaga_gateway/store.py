@@ -206,17 +206,30 @@ class GatewayStore:
             ).fetchone()
         return None if row is None else row["hermes_session_id"]
 
-    def has_stale_queued_messages(self, device_id: str, age_seconds: float) -> bool:
+    def has_stale_unfinished_messages(self, device_id: str, age_seconds: float) -> bool:
         cutoff = time.time() - max(float(age_seconds), 0.0)
         with self._lock:
             row = self._connection.execute(
                 """SELECT 1 FROM messages
-                   WHERE device_id = ? AND role = 'user' AND status = 'queued'
+                   WHERE device_id = ? AND role = 'user' AND status IN ('queued', 'started')
                      AND updated_at <= ?
                    LIMIT 1""",
                 (device_id, cutoff),
             ).fetchone()
         return row is not None
+
+    def stale_unfinished_admissions(self, device_id: str, age_seconds: float) -> list[str]:
+        cutoff = time.time() - max(float(age_seconds), 0.0)
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT admission_id FROM messages
+                   WHERE device_id = ? AND role = 'user'
+                     AND status IN ('queued', 'started')
+                     AND admission_id IS NOT NULL AND updated_at <= ?
+                   ORDER BY created_at""",
+                (device_id, cutoff),
+            ).fetchall()
+        return [str(row["admission_id"]) for row in rows]
 
     def set_hermes_session(self, device_id: str, session_id: str, snapshot: dict) -> None:
         with self._lock, self._connection:
