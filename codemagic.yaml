@@ -1,0 +1,16 @@
+workflows:
+  rabotyaga-ios-unsigned:
+    name: Rabotyaga iOS unsigned IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 15
+    environment:
+      xcode: "26.5"
+    scripts:
+      - name: Verify Apple toolchain
+        script: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+      - name: Build unsigned IPA
+        script: bash scripts/build_unsigned_ipa.sh
+    artifacts:
+      - build/Rabotyaga-unsigned.ipa

@@ -1,0 +1,19 @@
+appId: ru.rabotyaga.app
+name: Rabotyaga first-launch smoke test
+tags:
+  - smoke
+---
+- launchApp:
+    clearState: true
+- assertVisible: "Привет, начальник!"
+- assertVisible:
+    text: "Проверить Работягу"
+    enabled: true
+- assertVisible: "Версия 1.0"
+- assertNotVisible: "Первое приложение работает"
+- tapOn: "Проверить Работягу"
+- assertVisible: "Первое приложение работает"
+- stopApp
+- launchApp
+- assertVisible: "Привет, начальник!"
+- assertVisible: "Проверить Работягу"
